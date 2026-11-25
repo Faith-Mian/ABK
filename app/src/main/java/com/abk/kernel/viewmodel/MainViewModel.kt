@@ -211,12 +211,16 @@ data class MainUiState(
     val blurBackgroundExpEnabled: Boolean = false,
     val downloadDirectory: String = DownloadDirectoryUtils.defaultDirectoryPath(),
     val downloadMirrorBaseUrl: String = "",
+    val downloadThreadCount: Int = PreferencesRepository.DEFAULT_DOWNLOAD_THREAD_COUNT,
     val prebuiltGkiEnabled: Boolean = true,
     val artifactSigningVerificationEnabled: Boolean = true,
     val artifactSigningConfigured: Boolean = false,
     val artifactSigningOperationInFlight: Boolean = false,
     val customSourceSecretConfigured: Boolean = false,
     val customSourceSecretOperationInFlight: Boolean = false,
+    val kernelRunnerSettings: KernelRunnerSettingsUiState = KernelRunnerSettingsUiState(),
+    val customSourceDetecting: Boolean = false,
+    val customSourceDetectError: String? = null,
     val appUpdateStability: String = APP_UPDATE_STABILITY_STABLE,
     val appUpdateLine: String = APP_UPDATE_LINE_NORMAL,
     val appUpdateChecking: Boolean = false,
@@ -323,6 +327,7 @@ class MainViewModel @JvmOverloads constructor(
     private var buildQueueJob: Job? = null
     private var recentRunsRefreshJob: Job? = null
     private var recentRunsRefreshGeneration = 0
+    private var recentRunsRefreshIncludesCompletedArtifacts = false
     private val lateFailedArtifactWatchJobs = mutableMapOf<Long, Job>()
     private var foregroundWorkflowRefreshJob: Job? = null
     private var foregroundWorkflowRefreshIntervalSec =
@@ -336,6 +341,15 @@ class MainViewModel @JvmOverloads constructor(
 
     private val _uiState = MutableStateFlow(MainUiState())
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
+    private var kernelRunnerAuthIdentity: Pair<String?, String?>? = null
+    private val kernelRunnerSettingsCoordinator = KernelRunnerSettingsCoordinator(
+        scope = viewModelScope,
+        github = github,
+        readContext = { kernelRunnerContext() },
+        readState = { _uiState.value.kernelRunnerSettings },
+        updateState = { settings -> _uiState.update { it.copy(kernelRunnerSettings = settings) } },
+        unexpectedError = { text(R.string.settings_kernel_runner_request_failed) }
+    )
 
     private val _uiSurfaceAlphaPreview = MutableStateFlow(1f)
     val uiSurfaceAlphaPreview: StateFlow<Float> = _uiSurfaceAlphaPreview.asStateFlow()
@@ -500,6 +514,11 @@ class MainViewModel @JvmOverloads constructor(
             str = { resId, args -> text(resId, *args) },
         )
         observePreferences()
+        viewModelScope.launch {
+            uiState.map { kernelRunnerContext(it) }.distinctUntilChanged().collect {
+                kernelRunnerSettingsCoordinator.contextChanged()
+            }
+        }
         migrateBackgroundUriToInternalStorage()
         observeForegroundWorkflowRefresh()
         if (registerStatusBroadcast) {
@@ -538,6 +557,11 @@ class MainViewModel @JvmOverloads constructor(
             ) { token, name, avatar, autoDl, notify ->
                 Quintuple(token, name, avatar, autoDl, notify)
             }.collect { (token, name, avatar, autoDl, notify) ->
+                val identity = token to name
+                if (kernelRunnerAuthIdentity != identity) {
+                    kernelRunnerAuthIdentity = identity
+                    kernelRunnerSettingsCoordinator.contextChanged(force = true)
+                }
                 if (!token.isNullOrBlank()) {
                     github.updateToken(token)
                     _uiState.update {
@@ -626,6 +650,11 @@ class MainViewModel @JvmOverloads constructor(
         viewModelScope.launch {
             prefs.downloadMirrorBaseUrl.collect { url ->
                 _uiState.update { it.copy(downloadMirrorBaseUrl = url) }
+            }
+        }
+        viewModelScope.launch {
+            prefs.downloadThreadCount.collect { count ->
+                _uiState.update { it.copy(downloadThreadCount = count) }
             }
         }
         viewModelScope.launch {
@@ -984,6 +1013,7 @@ class MainViewModel @JvmOverloads constructor(
     }
 
     fun logout() {
+        kernelRunnerSettingsCoordinator.contextChanged(force = true)
         viewModelScope.launch {
             prefs.clearAuth()
             github.updateToken(null)
@@ -1024,6 +1054,22 @@ class MainViewModel @JvmOverloads constructor(
     }
 
     // ── Fork Management ───────────────────────────────────────────────────
+
+    private fun kernelRunnerContext(state: MainUiState = _uiState.value): KernelRunnerSettingsContext? {
+        if (!state.isLoggedIn) return null
+        val owner = state.user?.login ?: return null
+        val fork = state.forkRepo ?: return null
+        // Never write repository variables to upstream or a previous account's fork.
+        if (!fork.fork || !fork.fullName.equals("$owner/${fork.name}", ignoreCase = true) ||
+            fork.fullName.equals("${BuildConfig.SOURCE_REPO_OWNER}/${BuildConfig.SOURCE_REPO_NAME}", ignoreCase = true)
+        ) return null
+        return KernelRunnerSettingsContext(owner, fork.name, fork.defaultBranch, fork.id)
+    }
+
+    fun refreshKernelRunnerSettings() = kernelRunnerSettingsCoordinator.refresh()
+
+    fun saveKernelRunnerSettings(target: KernelRunnerTarget, labels: String, enabled: Boolean) =
+        kernelRunnerSettingsCoordinator.save(target, labels, enabled)
 
     @VisibleForTesting
     internal fun setTestUser(user: GitHubUser) {
@@ -1948,6 +1994,47 @@ class MainViewModel @JvmOverloads constructor(
         }
     }
 
+    /**
+     * 从 LOS 源码仓库根 Makefile 推断内核版本，成功后预填内核版本 override 与安全补丁月份。
+     * 失败不阻断（用户仍可手填），仅在 customSourceDetectError 记录原因。
+     */
+    fun detectCustomSourceVersion() {
+        val config = _uiState.value.buildConfig
+        if (config.buildTarget != BUILD_TARGET_CUSTOM_SOURCE) return
+        if (config.sourceUrl.isBlank() || config.sourceRef.isBlank()) return
+        if (_uiState.value.customSourceDetecting) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(customSourceDetecting = true, customSourceDetectError = null) }
+            try {
+                when (val result = github.fetchSourceMakefileVersion(config.sourceUrl, config.sourceRef)) {
+                    is Result.Success -> {
+                        val detected = result.data
+                        // 用检测到的完整版本推断一个默认安全补丁月份供用户参考/编辑。
+                        val recommended = KernelSupport.recommendedFromKernel(detected.toVersionString())
+                        val current = _uiState.value.buildConfig
+                        updateBuildConfig(
+                            current.copy(
+                                sourceKernelVersionOverride = detected.toVersionString(),
+                                osPatchLevel = recommended.osPatchLevel
+                            )
+                        )
+                    }
+                    is Result.Error -> {
+                        val message = if (result.message == "NON_GITHUB") {
+                            text(R.string.build_source_detect_non_github)
+                        } else {
+                            text(R.string.build_source_detect_failed)
+                        }
+                        _uiState.update { it.copy(customSourceDetectError = message) }
+                    }
+                    Result.Loading -> Unit
+                }
+            } finally {
+                _uiState.update { it.copy(customSourceDetecting = false) }
+            }
+        }
+    }
+
     private fun enqueueBuild(config: KernelBuildConfig) {
         val state = _uiState.value
         val buildConfig = KernelSupport.normalize(config)
@@ -2123,17 +2210,25 @@ class MainViewModel @JvmOverloads constructor(
 
     fun loadRecentRuns(
         showRefreshIndicator: Boolean = true,
-        lightweight: Boolean = false
+        lightweight: Boolean = false,
+        includeCompletedArtifacts: Boolean = false,
     ) {
         val state = _uiState.value
         val username = state.user?.login ?: return
         val repoName = state.forkRepo?.name ?: return
         val userInitiatedFull = showRefreshIndicator && !lightweight
+        val shouldIncludeCompleted = shouldIncludeCompletedArtifacts(
+            lightweight = lightweight,
+            includeCompletedArtifacts = includeCompletedArtifacts,
+        )
         if (recentRunsRefreshJob?.isActive == true) {
-            if (!userInitiatedFull) return
+            if (!userInitiatedFull &&
+                (!shouldIncludeCompleted || recentRunsRefreshIncludesCompletedArtifacts)
+            ) return
             recentRunsRefreshJob?.cancel()
         }
         val generation = ++recentRunsRefreshGeneration
+        recentRunsRefreshIncludesCompletedArtifacts = shouldIncludeCompleted
         recentRunsRefreshJob = viewModelScope.launch {
             _uiState.update { it.copy(isRefreshingRecentRuns = true) }
             try {
@@ -2165,7 +2260,7 @@ class MainViewModel @JvmOverloads constructor(
                             username,
                             repoName,
                             r.data,
-                            includeCompleted = !lightweight,
+                            includeCompleted = shouldIncludeCompleted,
                             includeCompletedPureManagers = lightweight,
                         )
                     }
@@ -2175,6 +2270,7 @@ class MainViewModel @JvmOverloads constructor(
                 if (generation == recentRunsRefreshGeneration) {
                     _uiState.update { it.copy(isRefreshingRecentRuns = false) }
                     recentRunsRefreshJob = null
+                    recentRunsRefreshIncludesCompletedArtifacts = false
                 }
             }
         }
@@ -2994,7 +3090,8 @@ class MainViewModel @JvmOverloads constructor(
                 text(R.string.vm_prebuilt_gki_label),
                 sourceAssetId = asset.id,
                 downloadDirectory,
-                bundleWithNotices = true
+                bundleWithNotices = true,
+                downloadThreadCount = _uiState.value.downloadThreadCount
             ) { pct ->
                 NotificationUtils.notifyDownloadProgress(getApplication(), pct, asset.name)
                 _uiState.update { s ->
@@ -3068,6 +3165,7 @@ class MainViewModel @JvmOverloads constructor(
                 downloadUrl,
                 downloadDirectory,
                 bundleWithNotices = true,
+                downloadThreadCount = _uiState.value.downloadThreadCount,
                 resolveSigningPublicKeyPem = {
                     val state = _uiState.value
                     val fork = state.forkRepo
@@ -3512,6 +3610,9 @@ class MainViewModel @JvmOverloads constructor(
     fun setDownloadMirrorBaseUrl(url: String) = viewModelScope.launch {
         prefs.setDownloadMirrorBaseUrl(url)
     }
+    fun setDownloadThreadCount(value: Int) = viewModelScope.launch {
+        prefs.setDownloadThreadCount(value)
+    }
     fun setPredictiveBackEnabled(v: Boolean) = viewModelScope.launch { prefs.setPredictiveBackEnabled(v) }
     fun setPrebuiltGkiEnabled(v: Boolean) = viewModelScope.launch {
         if (!v) {
@@ -3636,7 +3737,8 @@ class MainViewModel @JvmOverloads constructor(
                     getApplication(),
                     token = token,
                     url = downloadUrl,
-                    preferredLine = info.line
+                    preferredLine = info.line,
+                    downloadThreadCount = _uiState.value.downloadThreadCount
                 ) { progress ->
                     _uiState.update { state ->
                         state.copy(appUpdateDownloading = true, appUpdateDownloadProgress = progress)
@@ -4296,10 +4398,10 @@ class MainViewModel @JvmOverloads constructor(
                     ManagerSettingsLoad()
                 } else {
                     when {
-                    manager.isReSukiSu() -> ManagerSettingsLoad(
-                        backend = "resukisu",
-                        title = "ReSukiSU",
-                        items = buildReSukiSuSettings()
+                    manager.isBakaSu() -> ManagerSettingsLoad(
+                        backend = "bakasu",
+                        title = "BakaSU",
+                        items = buildBakaSuSettings()
                     )
                     manager.isSukiSu() -> ManagerSettingsLoad(
                         backend = "sukisu",
@@ -4373,7 +4475,7 @@ class MainViewModel @JvmOverloads constructor(
         )
     }
 
-    private fun buildReSukiSuSettings(): List<ManagerSettingItem> {
+    private fun buildBakaSuSettings(): List<ManagerSettingItem> {
         val suCompat = RootUtils.readKsuFeature("su_compat")
         val kernelUmount = RootUtils.readKsuFeature("kernel_umount")
         val kpmAvailable = RootUtils.isKpmAvailable()
@@ -4400,7 +4502,7 @@ class MainViewModel @JvmOverloads constructor(
                 ManagerSettingItem(
                     id = MANAGER_SETTING_SU_COMPAT,
                     title = text(R.string.vm_setting_su_compat_title),
-                    subtitle = featureSubtitle(suCompat, text(R.string.vm_setting_su_compat_desc), "ReSukiSU"),
+                    subtitle = featureSubtitle(suCompat, text(R.string.vm_setting_su_compat_desc), "BakaSU"),
                     kind = ManagerSettingKind.MODE,
                     selectedIndex = suCompatMode,
                     options = managerSuCompatOptions(),
@@ -4412,7 +4514,7 @@ class MainViewModel @JvmOverloads constructor(
                 ManagerSettingItem(
                     id = MANAGER_SETTING_KERNEL_UMOUNT,
                     title = text(R.string.vm_setting_kernel_umount_title),
-                    subtitle = featureSubtitle(kernelUmount, text(R.string.vm_setting_kernel_umount_desc), "ReSukiSU"),
+                    subtitle = featureSubtitle(kernelUmount, text(R.string.vm_setting_kernel_umount_desc), "BakaSU"),
                     checked = kernelUmount.value != 0L,
                     enabled = kernelUmount.support == RootUtils.KsuFeatureSupport.SUPPORTED,
                     status = kernelUmount.toManagerSettingStatus()
@@ -4433,7 +4535,7 @@ class MainViewModel @JvmOverloads constructor(
                     ManagerSettingItem(
                         id = MANAGER_SETTING_SELINUX_HIDE,
                         title = text(R.string.vm_setting_selinux_hide_title),
-                        subtitle = featureSubtitle(selinuxHide, text(R.string.vm_setting_selinux_hide_desc), "ReSukiSU"),
+                        subtitle = featureSubtitle(selinuxHide, text(R.string.vm_setting_selinux_hide_desc), "BakaSU"),
                         checked = selinuxHide.value != 0L,
                         enabled = true,
                         status = selinuxHide.toManagerSettingStatus()
@@ -4445,7 +4547,7 @@ class MainViewModel @JvmOverloads constructor(
                     ManagerSettingItem(
                         id = MANAGER_SETTING_ADB_ROOT,
                         title = "ADB Root",
-                        subtitle = featureSubtitle(adbRoot, text(R.string.vm_setting_adb_root_desc), "ReSukiSU"),
+                        subtitle = featureSubtitle(adbRoot, text(R.string.vm_setting_adb_root_desc), "BakaSU"),
                         checked = (adbRoot.configValue ?: adbRoot.value ?: 0L) != 0L,
                         enabled = adbRoot.support == RootUtils.KsuFeatureSupport.SUPPORTED,
                         status = adbRoot.toManagerSettingStatus()
@@ -4456,7 +4558,7 @@ class MainViewModel @JvmOverloads constructor(
                 ManagerSettingItem(
                     id = MANAGER_SETTING_SULOG,
                     title = text(R.string.vm_setting_sulog_title),
-                    subtitle = featureSubtitle(sulog, text(R.string.vm_setting_sulog_desc), "ReSukiSU"),
+                    subtitle = featureSubtitle(sulog, text(R.string.vm_setting_sulog_desc), "BakaSU"),
                     checked = sulog.value != 0L,
                     enabled = sulog.support == RootUtils.KsuFeatureSupport.SUPPORTED,
                     status = sulog.toManagerSettingStatus()
@@ -4641,14 +4743,24 @@ class MainViewModel @JvmOverloads constructor(
         }
     }
 
-    private fun RootUtils.ManagerRuntimeProbe.isReSukiSu(): Boolean {
-        val text = listOf(displayName, variant, version).joinToString(" ").lowercase()
-        return "resukisu" in text
-    }
+    private fun RootUtils.ManagerRuntimeProbe.isBakaSu(): Boolean =
+        runtimeKsuFamily() == KSU_VARIANT_BAKASU
 
-    private fun RootUtils.ManagerRuntimeProbe.isSukiSu(): Boolean {
-        val text = listOf(displayName, variant, version).joinToString(" ").lowercase()
-        return "sukisu" in text && "resukisu" !in text
+    private fun RootUtils.ManagerRuntimeProbe.isSukiSu(): Boolean =
+        runtimeKsuFamily() == KSU_VARIANT_SUKISU
+
+    /**
+     * Classifies the probe against the shared runtime family detector. Checks the
+     * structured [variant] first (control status / ksud inference, already canonical),
+     * then falls back to a combined scan of every string the probe carries. The retired
+     * `ReSukiSU` spelling contains `sukisu`, so a bare substring test would route BakaSU
+     * and legacy ReSukiSU kernels into the SukiSU settings group.
+     */
+    private fun RootUtils.ManagerRuntimeProbe.runtimeKsuFamily(): String? {
+        KernelSupport.inferRuntimeKsuFamily(variant)?.let { return it }
+        return KernelSupport.inferRuntimeKsuFamily(
+            listOf(displayName, version).joinToString(" ")
+        )
     }
 
     private fun RootUtils.ManagerRuntimeProbe.isOfficialKernelSu(): Boolean {
@@ -6109,6 +6221,32 @@ private data class ParsedCustomKernelOptionLine(
     val skipped: Boolean
 )
 
+// Unescapes backslash escapes (\" and \\) in a RAW kconfig assignment value so that
+// e.g. CONFIG_LOCALVERSION=\"-abk\" is stored as "-abk" rather than the escaped form.
+private fun unescapeRawKernelOptionValue(value: String): String {
+    if (!value.contains('\\')) return value
+    val sb = StringBuilder(value.length)
+    var i = 0
+    while (i < value.length) {
+        val c = value[i]
+        if (c == '\\' && i + 1 < value.length) {
+            when (val next = value[i + 1]) {
+                '"' -> sb.append('"')
+                '\\' -> sb.append('\\')
+                else -> {
+                    sb.append(c)
+                    sb.append(next)
+                }
+            }
+            i += 2
+        } else {
+            sb.append(c)
+            i++
+        }
+    }
+    return sb.toString()
+}
+
 private fun parseCustomKernelOptionLine(line: String): ParsedCustomKernelOptionLine {
     val clean = line.trim().replace("\r", "")
     if (clean.isBlank()) return ParsedCustomKernelOptionLine(option = null, skipped = true)
@@ -6139,7 +6277,7 @@ private fun parseCustomKernelOptionLine(line: String): ParsedCustomKernelOptionL
             option = CustomKernelOption(
                 symbol = symbol,
                 mode = mode,
-                rawValue = if (mode == CustomKernelOptionMode.RAW) value else ""
+                rawValue = if (mode == CustomKernelOptionMode.RAW) unescapeRawKernelOptionValue(value) else ""
             ),
             skipped = false
         )
@@ -6257,7 +6395,7 @@ private const val BUILD_PLAN_MAX_DEFCONFIGS = 128
 private const val OFFICIAL_BUILD_MODULE_CATALOG_ID = "official-abk-module-catalog"
 private const val OFFICIAL_BUILD_MODULE_CATALOG_URL = "https://github.com/xingguangcuican6666/ABK_repo"
 
-private val BUILD_PLAN_KSU_VARIANTS = listOf("Official", "SukiSU", "ReSukiSU", "None")
+private val BUILD_PLAN_KSU_VARIANTS = listOf("Official", "SukiSU", "BakaSU", "None")
 private val BUILD_PLAN_KSU_BRANCHES = KSU_BRANCH_BUILD_PLAN_OPTIONS
 private val BUILD_PLAN_VIRTUALIZATION_OPTIONS = listOf("off", "on", "678", "123", "345")
 private val BUILD_PLAN_MODULE_STAGES = listOf(
@@ -6507,9 +6645,10 @@ internal fun isPrebuiltGkiReleaseCandidate(release: GitHubReleaseSummary): Boole
 internal fun isPrebuiltGkiCandidate(asset: PrebuiltGkiAsset): Boolean {
     val lower = asset.name.lowercase()
     val type = DownloadUtils.classifyArtifact(asset.name)
-    if (!lower.endsWith(".bundle.zip")) return false
-    return type in setOf(ArtifactType.KERNEL_PACKAGE, ArtifactType.KERNEL_IMG, ArtifactType.ANYKERNEL3) ||
-        listOf("gki", "kernel", "boot", "anykernel", "ak3").any { lower.contains(it) }
+    if (type in setOf(ArtifactType.KERNEL_PACKAGE, ArtifactType.KERNEL_IMG, ArtifactType.ANYKERNEL3)) return true
+    if (type in setOf(ArtifactType.ABK_MANAGER, ArtifactType.KSU_MANAGER)) return false
+    if (lower.endsWith(".apk")) return false
+    return listOf("gki", "kernel", "boot", "anykernel", "ak3").any { lower.contains(it) }
 }
 
 internal fun prebuiltGkiComparator(
@@ -6560,7 +6699,7 @@ internal fun KernelBuildConfig.toInputMap(): Map<String, String> {
             "source_private" to (config.sourceAccessMode == SOURCE_ACCESS_GITHUB_PRIVATE).toString(),
             "defconfigs" to config.sourceDefconfigs.joinToString("\n"),
             "device_label" to config.sourceDeviceLabel,
-            "os_patch_level" to config.osPatchLevel,
+            "version_overrides" to buildVersionOverridesJson(config.osPatchLevel, config.sourceKernelVersionOverride),
             "kernelsu_variant" to config.kernelsuVariant,
             "kernelsu_branch" to config.kernelsuBranch,
             "custom_ref" to if (config.kernelsuBranch == KSU_BRANCH_CUSTOM) config.customRef else "",
@@ -6589,7 +6728,8 @@ internal fun KernelBuildConfig.toInputMap(): Map<String, String> {
             "android_version" to config.androidVersion,
             "kernel_version" to config.kernelVersion,
             "ksu_variant" to config.kernelsuVariant,
-            "enable_susfs" to (!config.cancelSusfs && config.kernelsuVariant != KSU_VARIANT_NONE).toString(),
+            "enable_susfs" to (!config.cancelSusfs && config.kernelsuVariant != KSU_VARIANT_NONE &&
+                KernelSupport.isSusfsSelectable(config.kernelsuVariant)).toString(),
             "use_kpm" to config.useKpm.toString(),
             "use_lz4kd" to config.onePlusUseLz4kd.toString(),
             "use_bbg" to config.useBbg.toString(),
@@ -6659,6 +6799,17 @@ private fun List<CustomExternalModule>?.toWorkflowInput(): String = this.orEmpty
         }
     }
     .joinToString("|")
+
+// kernel-source.yml 的 workflow_dispatch inputs 有 25 个上限；把 os_patch_level 与
+// kernel_version_override 两个"版本元数据覆盖"合并成一个 JSON input 以腾出槽位。
+// 工作流侧用 fromJSON(inputs.version_overrides).<key> 取回。
+private fun buildVersionOverridesJson(osPatchLevel: String, kernelVersionOverride: String): String =
+    Gson().toJson(
+        mapOf(
+            "os_patch_level" to osPatchLevel.trim().lowercase(),
+            "kernel_version_override" to kernelVersionOverride,
+        )
+    )
 
 private const val KERNEL_WORKFLOW_FILE = "kernel-custom.yml"
 private const val CUSTOM_SOURCE_WORKFLOW_FILE = "kernel-source.yml"
